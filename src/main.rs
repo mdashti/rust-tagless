@@ -1,408 +1,279 @@
 #![feature(box_syntax)]
 #![feature(box_patterns)]
+#![feature(refcell_replace_swap)]
 
 use std::collections::HashMap;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::any::Any;
+use std::cell::RefCell;
+use std::default::Default;
+use std::borrow::BorrowMut;
 
-#[derive(Debug, Clone)]
-enum Type {
-    Number,
-    Bool,
-}
-
-#[derive(Debug, Clone)]
-enum Value {
-    Number(i64),
-    Bool(bool),
-}
-
-type Name = &'static str;
-
-#[derive(Debug, Clone)]
-enum Variable {
-    Number(Cell<i64>),
-    Bool(Cell<bool>),
-}
-
-#[derive(Debug, Clone)]
-enum Expr {
-    Constant(Value),
-    Add(Box<Expr>, Box<Expr>), // e1 + e2
-    LessThan(Box<Expr>, Box<Expr>), // e1 < e2
-    Let(Name, Type, Box<Expr>, Box<Expr>), // let v::t = e1 in e2
-    Get(Name), // v
-    Set(Name, Box<Expr>), // v = e
-    While(Box<Expr>, Box<Expr>), // while e1 { e2 }
-}
-
-fn interpret(env: &HashMap<Name, Variable>, expr: &Expr) -> Value {
-    match *expr {
-        Expr::Constant(ref value) => value.clone(),
-        Expr::Add(ref expr1, ref expr2) => {
-            let value1 = interpret(env, expr1);
-            let value2 = interpret(env, expr2);
-            match (value1, value2) {
-                (Value::Number(number1), Value::Number(number2)) => Value::Number(
-                    number1 + number2,
-                ),
-                _ => panic!("Type error!"),
-            }
-        }
-        Expr::LessThan(ref expr1, ref expr2) => {
-            let value1 = interpret(env, expr1);
-            let value2 = interpret(env, expr2);
-            match (value1, value2) {
-                (Value::Number(number1), Value::Number(number2)) => Value::Bool(number1 < number2),
-                _ => panic!("Type error!"),
-            }
-        } 
-        Expr::Let(ref name, ref typ, ref expr1, ref expr2) => {
-            let value = interpret(env, expr1);
-            let mut env = env.clone();
-            match (typ, value) {
-                (&Type::Number, Value::Number(number)) => {
-                    env.insert(name, Variable::Number(Cell::new(number)));
-                    interpret(&env, expr2)
-                }
-                (&Type::Bool, Value::Bool(bool)) => {
-                    env.insert(name, Variable::Bool(Cell::new(bool)));
-                    interpret(&env, expr2)
-                }
-                _ => panic!("Type error!"),
-            }
-        }
-        Expr::Get(ref name) => {
-            match env.get(name).unwrap() {
-                &Variable::Number(ref number_cell) => Value::Number(number_cell.get()),
-                &Variable::Bool(ref bool_cell) => Value::Bool(bool_cell.get()),
-            }
-        }
-        Expr::Set(ref name, ref expr) => {
-            let value = interpret(env, expr);
-            match (env.get(name).unwrap(), &value) {
-                (&Variable::Number(ref number_cell), &Value::Number(number)) => {
-                    number_cell.set(number);
-                    value
-                }
-                (&Variable::Bool(ref bool_cell), &Value::Bool(bool)) => {
-                    bool_cell.set(bool);
-                    value
-                }
-                _ => panic!("Type error!"),
-            }
-        }
-        Expr::While(ref expr1, ref expr2) => {
-            while true {
-                match interpret(env, expr1) {
-                    Value::Bool(true) => {
-                        interpret(env, expr2);
-                    }
-                    Value::Bool(false) => break,
-                    _ => panic!("Type error!"),
-                }
-            }
-            Value::Bool(false)
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum StagedVariable {
-    Number(Rc<Cell<i64>>),
-    Bool(Rc<Cell<bool>>),
-}
-
-enum Staged {
-    Number(Box<Fn() -> i64>),
-    Bool(Box<Fn() -> bool>),
-}
-
-fn stage(env: &HashMap<Name, StagedVariable>, expr: &Expr) -> Staged {
-    match *expr {
-        Expr::Constant(Value::Number(number)) => Staged::Number(box move || number),
-        Expr::Constant(Value::Bool(bool)) => Staged::Bool(box move || bool),
-        Expr::Add(ref expr1, ref expr2) => {
-            let staged1 = stage(env, expr1);
-            let staged2 = stage(env, expr2);
-            match (staged1, staged2) {
-                (Staged::Number(number1), Staged::Number(number2)) => Staged::Number(box move || {
-                    number1() + number2()
-                }),
-                _ => panic!("Type error!"),
-            }
-        }
-        Expr::LessThan(ref expr1, ref expr2) => {
-            let staged1 = stage(env, expr1);
-            let staged2 = stage(env, expr2);
-            match (staged1, staged2) {
-                (Staged::Number(number1), Staged::Number(number2)) => Staged::Bool(box move || {
-                    number1() < number2()
-                }),
-                _ => panic!("Type error!"),
-            }
-        } 
-        Expr::Let(ref name, ref typ, ref expr1, ref expr2) => {
-            let staged1 = stage(&env, expr1);
-            let mut env = env.clone();
-            let staged_let: Box<Fn()> = match typ {
-                &Type::Number => {
-                    match staged1 {
-                        Staged::Number(number) => {
-                            let number_cell = Rc::new(Cell::new(0));
-                            env.insert(name, StagedVariable::Number(number_cell.clone()));
-                            box move || number_cell.set(number())
-                        }
-                        _ => panic!("Type error!"),
-                    }
-                }
-                &Type::Bool => {
-                    match staged1 {
-                        Staged::Bool(bool) => {
-                            let bool_cell = Rc::new(Cell::new(false));
-                            env.insert(name, StagedVariable::Bool(bool_cell.clone()));
-                            box move || bool_cell.set(bool())
-                        }
-                        _ => panic!("Type error!"),
-                    }
-                }
-            };
-            match stage(&env, expr2) {
-                Staged::Number(number) => Staged::Number(box move || {
-                    staged_let();
-                    number()
-                }),
-                Staged::Bool(bool) => Staged::Bool(box move || {
-                    staged_let();
-                    bool()
-                }),
-            }
-        }
-        Expr::Get(ref name) => {
-            match env.get(name).unwrap() {
-                &StagedVariable::Number(ref number_cell) => {
-                    let number_cell = number_cell.clone();
-                    Staged::Number(box move || number_cell.get())
-                }
-                &StagedVariable::Bool(ref bool_cell) => {
-                    let bool_cell = bool_cell.clone();
-                    Staged::Bool(box move || bool_cell.get())
-                }
-            }
-        }
-        Expr::Set(ref name, ref expr) => {
-            let staged = stage(env, expr);
-            match env.get(name).unwrap() {
-                &StagedVariable::Number(ref number_cell) => {
-                    match staged {
-                        Staged::Number(number) => {
-                            let number_cell = number_cell.clone();
-                            Staged::Number(box move || {
-                                let number = number();
-                                number_cell.set(number);
-                                number
-                            })
-                        }
-                        _ => panic!("Type error!"),
-                    }
-                }
-                &StagedVariable::Bool(ref bool_cell) => {
-                    match staged {
-                        Staged::Bool(bool) => {
-                            let bool_cell = bool_cell.clone();
-                            Staged::Bool(box move || {
-                                let bool = bool();
-                                bool_cell.set(bool);
-                                bool
-                            })
-                        }
-                        _ => panic!("Type error!"),
-                    }
-                }
-            }
-        }
-        Expr::While(ref expr1, ref expr2) => {
-            match stage(env, expr1) {
-                Staged::Bool(bool1) => {
-                    Staged::Bool(match stage(env, expr2) {
-                        Staged::Bool(bool2) => {
-                            box move || {
-                                while bool1() {
-                                    bool2();
-                                }
-                                false
-                            }
-                        }
-                        Staged::Number(number2) => {
-                            box move || {
-                                while bool1() {
-                                    number2();
-                                }
-                                false
-                            }
-                        }
-                    })
-                }
-                _ => panic!("Type error"),
-            }
-        }
-    }
-}
-
-struct Staged2 {
-    value: Box<Any>,
-}
-
-impl Staged2 {
-    fn new<T, F>(staged: F) -> Self
-    where
-        F: Fn() -> T + 'static,
-        T: 'static,
-    {
-        let box1: Box<F> = box staged;
-        let box2: Box<Any> = box box1 as Box<Any>;
-        Staged2 { value: box2 }
-    }
-
-    fn unwrap<T>(self) -> Box<Fn() -> T + 'static>
-    where
-        T: 'static,
-    {
-        match self.value.downcast().unwrap() {
-            box box1 => box1,
-        }
-    }
-}
-
-trait Runnable {
+trait Val {
     type Output;
+
+    fn get(&self) -> Self::Output;
+}
+
+#[derive(Debug,Clone, Eq, Ord, PartialOrd, PartialEq, Default)]
+struct NumVal {
+    v: i64,
+}
+
+impl Val for NumVal {
+    type Output = i64;
+
+    fn get(&self) -> Self::Output {
+        self.v
+    }
+}
+
+impl std::ops::Add for NumVal {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            v: self.v + rhs.v
+        }
+    }
+}
+
+#[derive(Debug,Clone, Eq, Ord, PartialOrd, PartialEq, Default)]
+struct BoolVal {
+    v: bool,
+}
+
+impl Val for BoolVal {
+    type Output = bool;
+
+    fn get(&self) -> Self::Output {
+        self.v
+    }
+}
+
+trait Exp {
+    type Output;
+
+    fn stage(&self) -> Box<StagedExp<Output=Self::Output>>;
+
+    fn interpret(&self) -> Self::Output;
+}
+
+trait StagedExp {
+    type Output;
+
     fn run(&self) -> Self::Output;
 }
 
-struct Constant<T> {
-    value: T,
+struct ConstantExp<T: 'static+Clone> {
+    const_val: T,
 }
 
-impl<T> Runnable for Constant<T>
-where
-    T: Copy,
-{
+struct ConstantStagedExp<T: 'static+Clone> {
+    const_val: T,
+}
+
+impl<T: 'static+Clone> Exp for ConstantExp<T>{
     type Output = T;
-    fn run(&self) -> T {
-        self.value
-    }
-}
 
-struct Add {
-    expr1: Box<Runnable<Output = i64>>,
-    expr2: Box<Runnable<Output = i64>>,
-}
-
-impl Runnable for Add {
-    type Output = i64;
-    fn run(&self) -> i64 {
-        self.expr1.run() + self.expr2.run()
-    }
-}
-
-struct LessThan {
-    expr1: Box<Runnable<Output = i64>>,
-    expr2: Box<Runnable<Output = i64>>,
-}
-
-impl Runnable for LessThan {
-    type Output = bool;
-    fn run(&self) -> bool {
-        self.expr1.run() < self.expr2.run()
-    }
-}
-
-struct Let<T1, T2> {
-    cell: Rc<Cell<T1>>,
-    expr1: Box<Runnable<Output = T1>>,
-    expr2: Box<Runnable<Output = T2>>,
-}
-
-impl<T1, T2> Runnable for Let<T1, T2>
-where
-    T1: Copy,
-{
-    type Output = T2;
-    fn run(&self) -> T2 {
-        self.cell.set(self.expr1.run());
-        self.expr2.run()
-    }
-}
-
-struct Get<T> {
-    cell: Rc<Cell<T>>,
-}
-
-impl<T> Runnable for Get<T>
-where
-    T: Copy,
-{
-    type Output = T;
-    fn run(&self) -> T {
-        self.cell.get()
-    }
-}
-
-struct Set<T> {
-    cell: Rc<Cell<T>>,
-    expr: Box<Runnable<Output = T>>,
-}
-
-impl<T> Runnable for Set<T>
-where
-    T: Copy,
-{
-    type Output = T;
-    fn run(&self) -> T {
-        let output = self.expr.run();
-        self.cell.set(output);
-        output
-    }
-}
-
-struct While<T> {
-    expr1: Box<Runnable<Output = bool>>,
-    expr2: Box<Runnable<Output = T>>,
-}
-
-impl<T> Runnable for While<T> {
-    type Output = bool;
-    fn run(&self) -> bool {
-        while self.expr1.run() {
-            self.expr2.run();
+    fn stage(&self) -> Box<StagedExp<Output=Self::Output>> {
+        box ConstantStagedExp {
+            const_val: self.const_val.clone()
         }
-        false
+    }
+    fn interpret(&self) -> Self::Output {
+        self.const_val.clone()
     }
 }
 
-struct StagedExpr {
-    value: Box<Any>,
+impl<T: 'static+Clone> StagedExp for ConstantStagedExp<T>{
+    type Output = T;
+
+    fn run(&self) -> Self::Output {
+        self.const_val.clone()
+    }
 }
 
-impl StagedExpr {
-    fn new<T, R>(runnable: R) -> Self
-    where
-        R: Runnable<Output = T> + 'static,
-        T: 'static,
-    {
-        let box1: Box<Runnable<Output = T>> = box runnable;
-        let box2: Box<Any> = box box1 as Box<Any>;
-        StagedExpr { value: box2 }
-    }
+static mut var_counter: i32 = 0;
 
-    fn unwrap<T>(self) -> Box<Runnable<Output = T>>
-    where
-        T: 'static,
-    {
-        match self.value.downcast().unwrap() {
-            box box1 => box1,
+#[derive(Debug,Clone)]
+struct VariableExp<T: 'static+Clone> {
+    id: i32,
+    var_val: Rc<RefCell<T>>,
+}
+
+impl<T: 'static+Clone+Default> VariableExp<T> {
+    fn fresh() -> VariableExp<T> {
+        VariableExp {
+            id: {
+                unsafe{
+                    var_counter += 1;
+                    var_counter
+                }
+            },
+            var_val: Rc::new(RefCell::new(T::default())),
         }
+    }
+}
+
+impl<T: 'static+Clone> VariableExp<T> {
+    fn fresh_with_val(v: T) -> VariableExp<T> {
+        VariableExp {
+            id: {
+                unsafe{
+                    var_counter += 1;
+                    var_counter
+                }
+            },
+            var_val: Rc::new(RefCell::new(v)),
+        }
+    }
+}
+
+impl<T: 'static+Clone> Exp for VariableExp<T>{
+    type Output = T;
+
+    fn stage(&self) -> Box<StagedExp<Output=Self::Output>> {
+        box self.clone()
+    }
+    fn interpret(&self) -> Self::Output {
+        self.var_val.borrow().clone()
+    }
+}
+
+impl<T: 'static+Clone> StagedExp for VariableExp<T>{
+    type Output = T;
+
+    fn run(&self) -> Self::Output {
+        self.var_val.borrow().clone()
+    }
+}
+
+struct AddExp {
+    exp1: Box<Exp<Output=NumVal>>,
+    exp2: Box<Exp<Output=NumVal>>,
+}
+
+struct AddStagedExp {
+    staged_exp1: Box<StagedExp<Output=NumVal>>,
+    staged_exp2: Box<StagedExp<Output=NumVal>>,
+}
+
+impl Exp for AddExp{
+    type Output = NumVal;
+
+    fn stage(&self) -> Box<StagedExp<Output=Self::Output>> {
+        box AddStagedExp {
+            staged_exp1: self.exp1.stage(),
+            staged_exp2: self.exp2.stage(),
+        }
+    }
+    fn interpret(&self) -> Self::Output {
+        self.exp1.interpret() + self.exp2.interpret()
+    }
+}
+
+impl StagedExp for AddStagedExp{
+    type Output = NumVal;
+
+    fn run(&self) -> Self::Output {
+        self.staged_exp1.run() + self.staged_exp2.run()
+    }
+}
+
+struct LessThanExp {
+    exp1: Box<Exp<Output=NumVal>>,
+    exp2: Box<Exp<Output=NumVal>>,
+}
+
+struct LessThanStagedExp {
+    staged_exp1: Box<StagedExp<Output=NumVal>>,
+    staged_exp2: Box<StagedExp<Output=NumVal>>,
+}
+
+impl Exp for LessThanExp{
+    type Output = BoolVal;
+
+    fn stage(&self) -> Box<StagedExp<Output=Self::Output>> {
+        box LessThanStagedExp {
+            staged_exp1: self.exp1.stage(),
+            staged_exp2: self.exp2.stage(),
+        }
+    }
+    fn interpret(&self) -> Self::Output {
+        Self::Output {
+            v: self.exp1.interpret() < self.exp2.interpret()
+        }
+    }
+}
+
+impl StagedExp for LessThanStagedExp{
+    type Output = BoolVal;
+
+    fn run(&self) -> Self::Output {
+        Self::Output {
+            v: self.staged_exp1.run() < self.staged_exp2.run()
+        }
+    }
+}
+
+struct LetExp<T: 'static+Clone, U: 'static+Clone> {
+    exp1: Box<Exp<Output=T>>,
+    exp2: Box<Fn(VariableExp<T>) -> Box<Exp<Output=U>>>
+}
+
+struct LetStagedExp<T: 'static+Clone, U: 'static+Clone> {
+    staged_exp1: Box<StagedExp<Output=T>>,
+    staged_exp1_var: VariableExp<T>,
+    staged_exp2: Box<StagedExp<Output=U>>,
+}
+
+impl<T: 'static+Clone+Default, U: 'static+Clone> Exp for LetExp<T,U>{
+    type Output = U;
+
+    fn stage(&self) -> Box<StagedExp<Output=Self::Output>> {
+        let exp1_var = VariableExp::fresh();
+        let staged_exp2 = (self.exp2)(exp1_var.clone()).stage();
+        box LetStagedExp {
+            staged_exp1: self.exp1.stage(),
+            staged_exp1_var: exp1_var,
+            staged_exp2,
+        }
+    }
+
+    fn interpret(&self) -> Self::Output {
+        let exp1_var = VariableExp::fresh_with_val(self.exp1.interpret());
+        (self.exp2)(exp1_var).interpret()
+    }
+}
+
+impl<T: 'static+Clone, U: 'static+Clone> StagedExp for LetStagedExp<T,U>{
+    type Output = U;
+
+    fn run(&self) -> Self::Output {
+        self.staged_exp1_var.var_val.replace( self.staged_exp1.run() );
+        self.staged_exp2.run()
+    }
+}
+
+fn unit_exp<T: 'static+Clone>(const_val: T) -> ConstantExp<T> {
+    ConstantExp {
+        const_val
+    }
+}
+
+fn add_exp(exp1: Box<Exp<Output=NumVal>>, exp2: Box<Exp<Output=NumVal>>) -> AddExp {
+    AddExp {
+        exp1,
+        exp2
+    }
+}
+
+fn let_exp<T: 'static+Clone+Default, U: 'static+Clone>(exp1: Box<Exp<Output=T>>,
+                                                       exp2: Box<Fn(VariableExp<T>) -> Box<Exp<Output=U>>>) -> LetExp<T,U> {
+    LetExp {
+        exp1,
+        exp2
     }
 }
 
@@ -412,21 +283,35 @@ fn main() {
     //     i = i + 1
     //   }
     // }
-    let expr = Expr::Let(
-        "i",
-        Type::Number,
-        box Expr::Constant(Value::Number(1)),
-        box Expr::While(
-            box Expr::LessThan(box Expr::Get("i"), box Expr::Constant(Value::Number(1000))),
-            box Expr::Set(
-                "i",
-                box Expr::Add(box Expr::Get("i"), box Expr::Constant(Value::Number(1))),
-            ),
-        ),
-    );
+//    let expr = Expr::Let(
+//        "i",
+//        Type::Number,
+//        box Expr::Constant(Value::Number(1)),
+//        box Expr::While(
+//            box Expr::LessThan(box Expr::Get("i"), box Expr::Constant(Value::Number(1000))),
+//            box Expr::Set(
+//                "i",
+//                box Expr::Add(box Expr::Get("i"), box Expr::Constant(Value::Number(1))),
+//            ),
+//        ),
+//    );
+//
+//    println!("{:?}", interpret(&HashMap::new(), &expr));
+//    if let Staged::Bool(bool) = stage(&HashMap::new(), &expr) {
+//        println!("{:?}", bool());
+//    }
 
-    println!("{:?}", interpret(&HashMap::new(), &expr));
-    if let Staged::Bool(bool) = stage(&HashMap::new(), &expr) {
-        println!("{:?}", bool());
-    }
+    let num1 = unit_exp(NumVal{ v: 1 });
+    let num2 = unit_exp(NumVal{ v: 2 });
+    let add_nums = add_exp(box num1, box num2);
+    let let_nums = let_exp(box add_nums, box |v| {
+        let num3 = unit_exp(NumVal{ v: 5 });
+        let add_nums2 = add_exp(box v, box num3);
+        box add_nums2
+    });
+
+    println!("{:?}", let_nums.interpret());
+
+    let staged_expr = let_nums.stage();
+    println!("{:?}", staged_expr.run());
 }
